@@ -1,0 +1,74 @@
+reclassCR <- function(status_col, time_col, data, prob = 0.8,
+                      covariate_cols, verbose = TRUE) {
+  
+  # Helper: Compute xmin (covariate profile closest to fitted coefficients)
+  xmin_func <- function(beta, d1) {
+    if (length(beta) != ncol(d1)) beta <- beta[seq_len(ncol(d1))]
+    w <- beta / sum(abs(beta))
+    xmin <- apply(d1, 2, function(x) mean(x, na.rm = TRUE))
+    xmin <- xmin + w * mean(as.matrix(d1) %*% beta, na.rm = TRUE)
+    return(xmin)
+  }
+  results <- list()
+  
+  # Each competing state
+  for (state_idx in seq_along(status_col)) {
+    state_name <- status_col[state_idx]
+    time_name  <- time_col[state_idx]
+    
+    if (verbose)
+      cat("Processing state:", state_name, "with time:", time_name, "\n")
+    
+    d <- data[, c(status_col[state_idx], time_col[state_idx], covariate_cols)]
+    names(d)[1:2] <- c("status", "time")
+    d$orig_index <- 1:nrow(d)
+
+    d0 <- d[d$status == 0, ]
+    d1 <- d[d$status == 1, ]
+    
+    if (nrow(d1) == 0 || nrow(d0) == 0) {
+      warning(paste("State", state_name, "has no censored or no events — skipped."))
+      next
+    }
+    
+    # Cox model
+    f <- as.formula(paste("Surv(time, status) ~", paste(covariate_cols, collapse = "+")))
+    fit <- coxph(f, data = d)
+    beta <- coef(fit)
+    
+    # Compute xmin and distances
+    xmin1 <- xmin_func(beta, d1[, covariate_cols])
+    xmin1_df <- as.data.frame(t(xmin1))
+    colnames(xmin1_df) <- covariate_cols
+    
+    Dscore <- sapply(seq_len(nrow(d0)), function(i) {
+      dtemp <- rbind(d0[i, covariate_cols, drop = FALSE], xmin1_df)
+      as.numeric(dist(dtemp, method = "euclidean"))
+    })
+    
+    # Define threshold and reclassify censored individuals
+    threshold <- quantile(Dscore, probs = prob)
+    reclass_idx <- which(Dscore <= threshold)
+    
+    reclass_rows <- d0$orig_index[reclass_idx]
+    data[[state_name]][reclass_rows] <- 1  
+    
+    if (verbose)
+      cat("Reclassified", length(reclass_idx), "of", nrow(d0), 
+          "censored individuals for state", state_name, ".\n")
+    
+    # Output summary
+    old_counts <- table(d$status)
+    new_counts <- table(data[[state_name]])
+    
+    results[[state_name]] <- list(
+      state = state_name,
+      old_counts = old_counts,
+      new_counts = new_counts,
+      threshold = threshold,
+      reclassified_rows = reclass_rows
+    )
+  }
+  
+  return(list(results = results, updated_data = data))
+}
