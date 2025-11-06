@@ -1,0 +1,197 @@
+reclassModelAgnostic <- function(status_col = "status",
+                                 time_col = "time",
+                                 data,
+                                 covariate_cols,
+                                 model_type = c("coxph", "rsf"),
+                                 model_object = NULL,
+                                 time_horizon = NULL,      # optional horizon for survival prediction (not used for LP)
+                                 combine = TRUE,           # combine model risk and proximity
+                                 weight_risk = 0.6,        # weight for model risk in joint score
+                                 weight_prox  = 0.4,       # weight for proximity
+                                 prob = 0.9,               # threshold quantile for reclassification
+                                 distance = c("euclidean", "mahalanobis"),
+                                 verbose = TRUE) {
+
+  stopifnot(is.data.frame(data))
+  if (!all(c(status_col, time_col) %in% names(data))) stop("status_col or time_col missing from data")
+  if (!all(covariate_cols %in% names(data))) stop("Some covariate_cols not in data")
+  model_type <- match.arg(model_type)
+  distance   <- match.arg(distance)
+  if (!(is.numeric(prob) && prob > 0 && prob < 1)) stop("'prob' must be in (0,1)")
+  if (abs(weight_risk + weight_prox - 1) > 1e-9) stop("weight_risk + weight_prox must equal 1")
+  
+  df <- data
+  n <- nrow(df)
+  df$.__orig_row__ <- seq_len(n)
+
+  status_vec <- as.numeric(as.character(df[[status_col]]))
+  if (any(!(status_vec %in% c(0,1)))) stop("status_col must be 0/1 (or coercible to 0/1)")
+  event_idx <- which(status_vec == 1)
+  cens_idx  <- which(status_vec == 0)
+  if (length(cens_idx) == 0) {
+    warning("No censored individuals found — nothing to do")
+    return(list(updated_data = df, message = "no censored"))
+  }
+  
+  # By default fit Cox PH if model_object is NULL
+  fitted_model <- model_object
+  if (is.null(fitted_model)) {
+    if (model_type == "coxph") {
+      if (verbose) message("Fitting Cox PH model...")
+      f <- as.formula(paste0("survival::Surv(", time_col, ", ", status_col, ") ~ ",
+                             paste(covariate_cols, collapse = " + ")))
+      fitted_model <- survival::coxph(f, data = df, x = TRUE)
+    } else if (model_type == "rsf") {
+      if (!requireNamespace("randomForestSRC", quietly = TRUE)) stop("Install 'randomForestSRC' for RSF")
+      if (verbose) message("Fitting Random Survival Forest (randomForestSRC::rfsrc)...")
+      f <- as.formula(paste0("survival::Surv(", time_col, ", ", status_col, ") ~ ",
+                             paste(covariate_cols, collapse = " + ")))
+      fitted_model <- randomForestSRC::rfsrc(f, data = df, na.action = "na.impute")
+    }
+  } else {
+    if (verbose) message("Using provided model_object (assuming it's compatible for prediction).")
+  }
+  
+  # Compute model risk score 
+  # For Cox: linear predictor (lp) -> relative risk = exp(lp)
+  model_risk <- rep(NA_real_, n)
+  if (inherits(fitted_model, "coxph")) {
+    lp <- predict(fitted_model, newdata = df, type = "lp")
+    model_risk <- as.numeric(exp(lp))  # relative risk (positive)
+    if (!is.null(time_horizon)) {
+      if (verbose) message("time_horizon provided but using linear predictor (ranking) for risk.")
+    }
+  } else if (inherits(fitted_model, "rfsrc")) {
+    preds <- predict(fitted_model, newdata = df)
+    if (!is.null(preds$survival)) {
+      surv_mat <- preds$survival
+      model_risk <- 1 - surv_mat[, ncol(surv_mat)]
+    } else {
+      stop("Unexpected RSF predict structure")
+    }
+  } else {
+    pr_try <- try(predict(fitted_model, newdata = df), silent = TRUE)
+    if (!inherits(pr_try, "try-error") && is.numeric(pr_try)) {
+      model_risk <- as.numeric(pr_try)
+    } else {
+      stop("Cannot extract model risk from provided model_object. Supply a coxph or rfsrc or compatible model.")
+    }
+  }
+  
+  # normalize model risk to [0,1] (higher => more event-like)
+  risk_norm <- (model_risk - min(model_risk, na.rm = TRUE)) /
+    (diff(range(model_risk, na.rm = TRUE)) + 1e-12)
+  
+  # Get coefficient signs from fitted_model; fall back to univariate Cox sign
+  coef_vec <- NULL
+  if (!is.null(model_object)) {
+    try({
+      coef_vec <- coef(fitted_model)
+      if (!is.null(coef_vec) && length(coef_vec) >= 1) {
+        coef_vec <- as.numeric(coef_vec)
+        names(coef_vec) <- names(coef(fitted_model))
+      } else coef_vec <- NULL
+    }, silent = TRUE)
+  }
+  
+  if (is.null(coef_vec)) {
+    coef_signs <- sapply(covariate_cols, function(v) {
+      f0 <- try(survival::coxph(as.formula(paste0("survival::Surv(", time_col, ",", status_col, ") ~ ", v)), data = df), silent = TRUE)
+      if (inherits(f0, "try-error")) return(0)
+      s <- summary(f0)
+      coef1 <- as.numeric(s$coefficients[1, "coef"])
+      sign(coef1)
+    })
+    coef_vec <- coef_signs
+    names(coef_vec) <- covariate_cols
+  } else {
+    if (!all(covariate_cols %in% names(coef_vec))) {
+      uni_signs <- sapply(covariate_cols, function(v) {
+        f0 <- try(survival::coxph(as.formula(paste0("survival::Surv(", time_col, ",", status_col, ") ~ ", v)), data = df), silent = TRUE)
+        if (inherits(f0, "try-error")) return(0)
+        s <- summary(f0)
+        as.numeric(s$coefficients[1, "coef"])
+      })
+      coef_vec <- uni_signs
+      names(coef_vec) <- covariate_cols
+    } else {
+      coef_vec <- coef_vec[covariate_cols]
+    }
+  }
+  
+  # build xmin profile: if coef>0 -> min(event group), coef<0 -> max(event group), else median
+  events_df <- df[event_idx, covariate_cols, drop = FALSE]
+  xmin_vec <- sapply(seq_along(covariate_cols), function(i) {
+    col <- covariate_cols[i]
+    val <- coef_vec[i]
+    if (is.na(val) || val == 0) return(median(events_df[[col]], na.rm = TRUE))
+    if (val > 0) return(min(events_df[[col]], na.rm = TRUE))
+    else return(max(events_df[[col]], na.rm = TRUE))
+  })
+  names(xmin_vec) <- covariate_cols
+  
+  # Compute distance for censored individuals
+  cens_df <- df[cens_idx, covariate_cols, drop = FALSE]
+  if (distance == "mahalanobis") {
+    cov_mat <- stats::cov(events_df, use = "pairwise.complete.obs")
+    if (det(cov_mat) == 0 || any(is.na(cov_mat))) {
+      cov_mat <- cov_mat + diag(1e-6, ncol(cov_mat))
+    }
+    inv_cov <- try(solve(cov_mat), silent = TRUE)
+    if (inherits(inv_cov, "try-error")) {
+      inv_cov <- diag(1, ncol(cov_mat))
+    }
+    dist_vec <- apply(as.matrix(cens_df), 1, function(r) {
+      diff <- as.numeric(r - xmin_vec)
+      sqrt(as.numeric(t(diff) %*% inv_cov %*% diff))
+    })
+  } else {
+    sds <- apply(events_df, 2, sd, na.rm = TRUE)
+    sds[sds == 0] <- 1
+    xmin_scaled <- xmin_vec / sds
+    cens_scaled <- t(t(as.matrix(cens_df)) / sds)
+    dist_vec <- apply(cens_scaled, 1, function(r) sqrt(sum((r - xmin_scaled)^2, na.rm = TRUE)))
+  }
+  ecdf_fun <- ecdf(dist_vec)
+  proximity <- 1 - ecdf_fun(dist_vec)
+  
+  # Map proximity back to full n-length vector (NA for non-censored)
+  prox_full <- rep(NA_real_, n); prox_full[cens_idx] <- proximity
+  risk_full <- risk_norm
+  
+  joint_full <- rep(NA_real_, n)
+  if (combine) {
+    prox_norm <- (proximity - min(proximity, na.rm = TRUE)) / (diff(range(proximity, na.rm = TRUE)) + 1e-12)
+    joint_vals <- weight_risk * risk_full[cens_idx] + weight_prox * prox_norm
+    joint_full[cens_idx] <- joint_vals
+    thr <- as.numeric(quantile(joint_vals, probs = prob, na.rm = TRUE))
+    to_reclass_local <- which(joint_vals > thr)
+    to_reclass_rows <- df$.__orig_row__[cens_idx[to_reclass_local]]
+  } else {
+    thr <- as.numeric(quantile(proximity, probs = prob, na.rm = TRUE))
+    to_reclass_local <- which(proximity > thr)
+    to_reclass_rows <- df$.__orig_row__[cens_idx[to_reclass_local]]
+    joint_full[cens_idx] <- prox_norm
+  }
+
+  updated_df <- df
+  updated_df[[status_col]] <- status_vec
+  if (length(to_reclass_rows) > 0) {
+    updated_df[[status_col]][to_reclass_rows] <- 1
+  }
+  
+  out <- list(
+    updated_data = updated_df[ , setdiff(names(updated_df), ".__orig_row__")],
+    reclassified_rows = to_reclass_rows,
+    reclassified_ids  = if ("id" %in% names(df)) df$id[to_reclass_rows] else to_reclass_rows,
+    proximity_censored = data.frame(orig_row = df$.__orig_row__[cens_idx], distance = dist_vec, proximity = proximity),
+    model_risk_full = risk_full,
+    joint_score_full = joint_full,
+    threshold = thr,
+    details = list(model = fitted_model, xmin = xmin_vec)
+  )
+  if (verbose) {
+    message("Reclassified ", length(to_reclass_rows), " censored individuals (threshold = ", round(thr,4), ").")
+  }
+  return(out)
+}
