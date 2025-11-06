@@ -1,0 +1,111 @@
+reclassMS <- function(status_col, time_col, data, prob = 0.9,
+                      covariate_cols, verbose = TRUE,
+                      return_combined = TRUE) {
+  # status_col: character vector of status column names (one per state)
+  # time_col:   character vector of time column names (same length)
+  # data:       original data.frame (keeps original row order)
+  # covariate_cols: character vector of covariate column names used for distance
+  stopifnot(is.data.frame(data))
+  if (length(status_col) != length(time_col)) stop("'status_col' and 'time_col' must have equal length")
+  if (any(!status_col %in% colnames(data))) stop("Some status_col not found in data")
+  if (any(!time_col %in% colnames(data))) stop("Some time_col not found in data")
+  if (any(!covariate_cols %in% colnames(data))) stop("Some covariate_cols not found in data")
+  
+  n <- nrow(data)
+  ids <- if ("id" %in% colnames(data)) as.character(data$id) else as.character(seq_len(n))
+  
+  results_list <- list()
+  combined_data <- data
+  
+  for (s_i in seq_along(status_col)) {
+    s_col <- status_col[s_i]
+    t_col <- time_col[s_i]
+    if (verbose) message("Processing state/time: ", s_col, " / ", t_col)
+    raw_status <- data[[s_col]]
+    status_numeric <- as.numeric(as.character(raw_status))
+    if (any(is.na(status_numeric))) {
+      stop("Status column '", s_col, "' contains non-numeric values that cannot be coerced to 0/1. Convert to 0/1 first.")
+    }
+    event_idx   <- which(status_numeric == 1)
+    cens_idx    <- which(status_numeric == 0)
+    
+    if (length(event_idx) == 0) {
+      warning("No events (1) found for ", s_col, " — skipping.")
+      results_list[[s_col]] <- list(
+        state = s_col,
+        old_counts = table(factor(status_numeric, levels = c(0,1))),
+        new_counts = table(factor(status_numeric, levels = c(0,1))),
+        threshold = NA_real_,
+        reclassified_ids = character(0),
+        updated_status = status_numeric
+      )
+      next
+    }
+    if (length(cens_idx) == 0) {
+      warning("No censored (0) observations for ", s_col, " — nothing to reclassify.")
+      results_list[[s_col]] <- list(
+        state = s_col,
+        old_counts = table(factor(status_numeric, levels = c(0,1))),
+        new_counts = table(factor(status_numeric, levels = c(0,1))),
+        threshold = NA_real_,
+        reclassified_ids = character(0),
+        updated_status = status_numeric
+      )
+      next
+    }
+    
+    # Covariate matrices
+    cov_mat_events <- data[event_idx, covariate_cols, drop = FALSE]
+    cov_mat_cens   <- data[cens_idx,  covariate_cols, drop = FALSE]
+    
+    # Ensure numeric covariates
+    non_numeric <- covariate_cols[!sapply(cov_mat_events, is.numeric)]
+    if (length(non_numeric) > 0) {
+      stop("Covariate(s) not numeric: ", paste(non_numeric, collapse = ", "),
+           ". Convert to numeric or remove them before calling.")
+    }
+    event_center <- colMeans(cov_mat_events, na.rm = TRUE)
+    
+    # Compute Euclidean distances: events and censored individuals
+    dist_events <- apply(cov_mat_events, 1, function(r) sqrt(sum((r - event_center)^2, na.rm = TRUE)))
+    dist_cens   <- apply(cov_mat_cens,   1, function(r) sqrt(sum((r - event_center)^2, na.rm = TRUE)))
+    
+    # if prob is high (e.g., 0.9) this picks a smaller set of closest events' distances as threshold
+    threshold <- as.numeric(quantile(dist_events, probs = prob, na.rm = TRUE))
+    
+    # Reclassify censored individuals whose distance <= threshold
+    to_reclass_local_idx <- which(dist_cens <= threshold)
+    reclass_rownums <- cens_idx[to_reclass_local_idx]
+    reclass_ids     <- ids[reclass_rownums]
+    
+    updated_status <- status_numeric
+    if (length(reclass_rownums) > 0) {
+      updated_status[reclass_rownums] <- 1L
+    }
+    
+    if (return_combined) {
+      combined_data[[s_col]] <- updated_status
+    }
+    
+    old_counts <- table(factor(status_numeric, levels = c(0,1)))
+    new_counts <- table(factor(updated_status, levels = c(0,1)))
+    
+    results_list[[s_col]] <- list(
+      state = s_col,
+      old_counts = old_counts,
+      new_counts = new_counts,
+      threshold = threshold,
+      reclassified_rownums = reclass_rownums,   
+      reclassified_ids = reclass_ids,         
+      updated_status = updated_status
+    )
+    if (verbose) {
+      message("Reclassified ", length(reclass_rownums), " censored individuals for state ", s_col, ".")
+    }
+  }
+  
+  if (return_combined) {
+    results_list$combined_updated_data <- combined_data
+  }
+  return(results_list)
+}
