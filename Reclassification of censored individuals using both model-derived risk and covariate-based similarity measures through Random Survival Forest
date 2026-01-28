@@ -195,3 +195,36 @@ reclassModelAgnostic <- function(status_col = "status",
   }
   return(out)
 }
+
+### Example
+set.seed(123)
+n <- 150
+sim_dat <- data.frame(
+  id = 1:n,
+  time   = rexp(n, rate = 0.08),
+  status = rbinom(n, 1, 0.3),   # 30% events
+  age  = rnorm(n, 55, 10),
+  bmi  = rnorm(n, 26, 4),
+  lab  = rnorm(n, 100, 15)
+)
+head(sim_dat)
+
+out_rfs <- reclassModelAgnostic(
+  status_col     = "status",
+  time_col       = "time",
+  data           = sim_dat,
+  covariate_cols = c("age", "bmi", "lab"),
+  model_type     = "coxph",     # default
+  combine        = TRUE,
+  weight_risk    = 0.6,
+  weight_prox    = 0.4,
+  prob           = 0.9,
+  verbose        = TRUE
+)
+table(sim_dat$status)
+table(out_rfs$updated_data$status)
+head(out_rfs$reclassified_rows)
+############################################################
+
+
+
