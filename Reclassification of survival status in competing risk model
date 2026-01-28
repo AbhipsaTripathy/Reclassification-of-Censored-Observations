@@ -72,3 +72,26 @@ reclassCR <- function(status_col, time_col, data, prob = 0.8,
   
   return(list(results = results, updated_data = data))
 }
+
+### Example
+###################################################
+set.seed(123)
+n <- 100
+data <- data.frame(
+  # Event 1 
+  status1 = rbinom(n, 1, 0.3),time1 = rexp(n, rate = 0.1),
+  # Event 2
+  status2 = rbinom(n, 1, 0.2),time2 = rexp(n, rate = 0.15),
+  # Covariates
+  age = rnorm(n, mean = 50, sd = 10),bmi = rnorm(n, mean = 25, sd = 4)
+)
+head(data)
+status_col    <- c("status1", "status2")
+time_col      <- c("time1", "time2")
+covariates    <- c("age", "bmi")
+
+mod_comp <- reclassCR(
+  status_col     = status_col,time_col = time_col,
+  data           = data,prob = 0.8,covariate_cols = covariates,
+  verbose        = TRUE)
+#################################################################
