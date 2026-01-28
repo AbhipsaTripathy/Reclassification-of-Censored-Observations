@@ -4,7 +4,7 @@ reclassModelAgnostic <- function(status_col = "status",
                                  covariate_cols,
                                  model_type = c("coxph", "rsf"),
                                  model_object = NULL,
-                                 time_horizon = NULL,      # optional horizon for survival prediction (not used for LP)
+                                 time_horizon = NULL,      
                                  combine = TRUE,           # combine model risk and proximity
                                  weight_risk = 0.6,        # weight for model risk in joint score
                                  weight_prox  = 0.4,       # weight for proximity
