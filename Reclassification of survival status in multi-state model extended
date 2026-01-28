@@ -109,3 +109,30 @@ reclassMS <- function(status_col, time_col, data, prob = 0.9,
   }
   return(results_list)
 }
+
+## Examples
+########################################################
+set.seed(42)
+n <- 120
+sim_data <- data.frame(
+  id = 1:n,
+  # State 1
+  status1 = rbinom(n, 1, 0.25),
+  time1   = rexp(n, 0.08),
+  # State 2
+  status2 = rbinom(n, 1, 0.20),
+  time2   = rexp(n, 0.10),
+  # Covariates
+  age  = rnorm(n, 55, 8),
+  bmi  = rnorm(n, 26, 3),
+  lab  = rnorm(n, 100, 15)
+)
+head(sim_data)
+
+out_msm <- reclassMS(
+  status_col     = c("status1", "status2"),
+  time_col       = c("time1", "time2"),
+  data           = sim_data,prob = 0.9,
+  covariate_cols = c("age", "bmi", "lab"),verbose = TRUE
+)
+########################################################
